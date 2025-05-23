@@ -64,7 +64,7 @@ MIT License – feel free to use and modify this project.
 
 ## 🙌 Author
 
-Made with ❤️ by [Your Name]
+Made with ❤️ by Haris Khan FA23-BCS-063 COMSATS University Lahore Campus
 
-🔗 Also check out the **video tutorial** on YouTube: [Your YouTube link]
+🔗 Also check out the **video tutorial** on YouTube:[ [Your YouTube link]](https://youtu.be/AG-ZLdCfti8)
 
