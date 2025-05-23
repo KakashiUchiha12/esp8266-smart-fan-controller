@@ -28,7 +28,7 @@ Control a 12V DC fan using an ESP8266, rotary encoder, and WebSocket-based web U
 
 ## 🔌 Wiring Diagram
 
-![Wiring Diagram]([images/circuit-diagram.png](https://content.instructables.com/FFR/JSR2/MB0T9XX8/FFRJSR2MB0T9XX8.png?auto=webp&width=1600&height=900&fit=bounds&md=RnJpIE1heSAyMyAxMzowMDoyOCBQRFQgMjAyNQ==))
+![Wiring Diagram](https://github.com/KakashiUchiha12/esp8266-smart-fan-controller/blob/main/images/ui-screenshot.png])
 
 📥 Full instructions and photos on **Instructables**: [🔗 Click here](https://www.instructables.com/your-project-link)
 
@@ -41,7 +41,8 @@ Control a 12V DC fan using an ESP8266, rotary encoder, and WebSocket-based web U
 
 ## 🖥️ Web UI Preview
 
-![Web UI Screenshot](images/ui-screenshot.png)
+![UI Screenshot](https://raw.githubusercontent.com/KakashiUchiha12/esp8266-smart-fan-controller/main/images/ui-screenshot.png)
+
 
 ## 📂 Folder Structure
 
