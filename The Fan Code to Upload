@@ -1,0 +1,305 @@
+// ESP8266 Fan Controller with Hotspot and WebSocket Interface
+
+#include <ESP8266WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPAsyncTCP.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+#include <DNSServer.h>
+
+// Pin Definitions
+const int IN1 = 14;    // GPIO14 (D5)
+const int IN2 = 12;    // GPIO12 (D6)
+const int ENA = 13;    // GPIO13 (D7)
+const int encoderCLK = 4;  // GPIO4 (D2)
+const int encoderDT = 5;   // GPIO5 (D1)
+const int encoderSW = 0;   // GPIO0 (D3)
+
+// Control Variables
+int fanSpeed = 0;          // PWM speed (0-255)
+bool fanDirection = true;  // true = forward, false = reverse
+bool fanOn = false;        // Fan on/off state
+int lastCLKState;          // Encoder rotation state
+unsigned long lastDebounceTime = 0;
+const int debounceDelay = 100; // Debounce delay (ms)
+
+// Analytics Variables
+unsigned long fanStartTime = 0;  // Current session start
+unsigned long totalOnTime = 0;   // Total fan runtime (seconds)
+unsigned long lastUpdateTime = 0; // Last analytics update
+struct FanSession {              // Avoid conflict with BearSSL::Session
+  unsigned long startTime;
+  unsigned long duration;
+};
+FanSession sessionHistory[5];    // Store last 5 sessions
+int historyCount = 0;
+
+// Schedule Variables
+unsigned long scheduleEndTime = 0; // When to turn off fan
+bool scheduleActive = false;
+
+// Wi-Fi and Server Setup
+const char* ssid = "MyFan";
+const char* password = "fan123456";
+AsyncWebServer server(80);
+WebSocketsServer webSocket(81);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// HTML Page
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>MyFan Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+    h1 { color: #333; }
+    .button { padding: 10px 20px; margin: 10px; font-size: 16px; cursor: pointer; }
+    .slider { width: 80%; margin: 20px auto; }
+    .analytics { margin-top: 20px; text-align: left; display: inline-block; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+  </style>
+</head>
+<body>
+  <h1>MyFan Control</h1>
+  <button class="button" onclick="toggleFan()">Toggle Fan</button>
+  <p>Fan Status: <span id="fanStatus">OFF</span></p>
+  <p>Speed: <span id="fanSpeed">0</span></p>
+  <input type="range" min="0" max="255" value="0" class="slider" id="speedSlider" oninput="updateSpeed(this.value)">
+  <p>Direction: <span id="fanDirection">Forward</span></p>
+  <button class="button" onclick="toggleDirection()">Toggle Direction</button>
+  <p>Schedule: <span id="scheduleStatus">Inactive</span></p>
+  <input type="number" id="scheduleMinutes" placeholder="Minutes" min="1">
+  <button class="button" onclick="setSchedule()">Set Schedule</button>
+  <div class="analytics">
+    <h2>Analytics</h2>
+    <p>Total On-Time: <span id="totalOnTime">0</span> seconds</p>
+    <p>Current Session: <span id="sessionTime">0</span> seconds</p>
+    <h3>Runtime History</h3>
+    <table id="historyTable">
+      <tr><th>Start Time</th><th>Duration (s)</th></tr>
+    </table>
+  </div>
+  <script>
+    let ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+    ws.onmessage = function(event) {
+      let data = JSON.parse(event.data);
+      document.getElementById('fanStatus').innerText = data.fanOn ? 'ON' : 'OFF';
+      document.getElementById('fanSpeed').innerText = data.fanSpeed;
+      document.getElementById('speedSlider').value = data.fanSpeed;
+      document.getElementById('fanDirection').innerText = data.fanDirection ? 'Forward' : 'Reverse';
+      document.getElementById('totalOnTime').innerText = data.totalOnTime;
+      document.getElementById('sessionTime').innerText = data.sessionTime;
+      document.getElementById('scheduleStatus').innerText = data.scheduleActive ? 'Active' : 'Inactive';
+      let table = document.getElementById('historyTable');
+      table.innerHTML = '<tr><th>Start Time</th><th>Duration (s)</th></tr>';
+      data.history.forEach(session => {
+        let row = table.insertRow();
+        row.insertCell(0).innerText = new Date(session.startTime * 1000).toLocaleString();
+        row.insertCell(1).innerText = session.duration;
+      });
+    };
+    function toggleFan() {
+      ws.send(JSON.stringify({ action: 'toggleFan' }));
+    }
+    function updateSpeed(value) {
+      ws.send(JSON.stringify({ action: 'setSpeed', value: parseInt(value) }));
+    }
+    function toggleDirection() {
+      ws.send(JSON.stringify({ action: 'toggleDirection' }));
+    }
+    function setSchedule() {
+      let minutes = parseInt(document.getElementById('scheduleMinutes').value);
+      if (minutes > 0) {
+        ws.send(JSON.stringify({ action: 'setSchedule', value: minutes }));
+      }
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(encoderCLK, INPUT_PULLUP);
+  pinMode(encoderDT, INPUT_PULLUP);
+  pinMode(encoderSW, INPUT_PULLUP);
+  lastCLKState = digitalRead(encoderCLK);
+
+  // Set up hotspot
+  WiFi.softAP(ssid, password);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  Serial.println("Hotspot started: MyFan");
+
+  // Set up DNS server for captive portal
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  // Web server routes
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Start servers
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  server.begin();
+
+  // Initialize fan
+  updateFan();
+}
+
+void loop() {
+  webSocket.loop();
+  dnsServer.processNextRequest();
+
+  // Handle rotary encoder
+  int currentCLK = digitalRead(encoderCLK);
+  if (currentCLK != lastCLKState && currentCLK == LOW) {
+    int dtState = digitalRead(encoderDT);
+    if (dtState != currentCLK) {
+      fanSpeed += 10;
+    } else {
+      fanSpeed -= 10;
+    }
+    fanSpeed = constrain(fanSpeed, 0, 255);
+    fanOn = fanSpeed > 0;
+    if (fanOn && fanStartTime == 0) {
+      fanStartTime = millis() / 1000;
+    } else if (!fanOn && fanStartTime != 0) {
+      endSession();
+    }
+    updateFan();
+    broadcastState();
+  }
+  lastCLKState = currentCLK;
+
+  // Handle button press
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = digitalRead(encoderSW);
+  if (currentButtonState != lastButtonState) {
+    if (millis() - lastDebounceTime > debounceDelay) {
+      Serial.print("Button State Changed: Last=");
+      Serial.print(lastButtonState);
+      Serial.print(", Current=");
+      Serial.println(currentButtonState);
+      if (currentButtonState == LOW) {
+        fanDirection = !fanDirection;
+        Serial.print("Button pressed, Direction toggled to: ");
+        Serial.println(fanDirection ? "Forward" : "Reverse");
+        updateFan();
+        broadcastState();
+      }
+      lastDebounceTime = millis();
+    }
+  }
+  lastButtonState = currentButtonState;
+
+  // Update analytics
+  if (fanOn && millis() - lastUpdateTime >= 1000) {
+    totalOnTime++;
+    lastUpdateTime = millis();
+    broadcastState();
+  }
+
+  // Handle schedule
+  if (scheduleActive && millis() / 1000 >= scheduleEndTime) {
+    fanOn = false;
+    fanSpeed = 0;
+    scheduleActive = false;
+    endSession();
+    updateFan();
+    broadcastState();
+  }
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_TEXT) {
+    DynamicJsonDocument doc(200);
+    deserializeJson(doc, payload);
+    String action = doc["action"];
+    if (action == "toggleFan") {
+      fanOn = !fanOn;
+      if (!fanOn) {
+        fanSpeed = 0;
+        endSession();
+      } else if (fanStartTime == 0) {
+        fanStartTime = millis() / 1000;
+      }
+    } else if (action == "setSpeed") {
+      fanSpeed = doc["value"];
+      fanSpeed = constrain(fanSpeed, 0, 255);
+      fanOn = fanSpeed > 0;
+      if (fanOn && fanStartTime == 0) {
+        fanStartTime = millis() / 1000;
+      } else if (!fanOn && fanStartTime != 0) {
+        endSession();
+      }
+    } else if (action == "toggleDirection") {
+      fanDirection = !fanDirection;
+    } else if (action == "setSchedule") {
+      int minutes = doc["value"];
+      scheduleEndTime = millis() / 1000 + minutes * 60;
+      scheduleActive = true;
+      fanOn = true;
+      if (fanSpeed == 0) fanSpeed = 100; // Default speed
+      if (fanStartTime == 0) fanStartTime = millis() / 1000;
+    }
+    updateFan();
+    broadcastState();
+  }
+}
+
+void updateFan() {
+  analogWrite(ENA, fanOn ? fanSpeed : 0);
+  if (fanDirection) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  }
+}
+
+void endSession() {
+  if (fanStartTime != 0) {
+    unsigned long duration = millis() / 1000 - fanStartTime;
+    if (historyCount < 5) {
+      sessionHistory[historyCount] = {fanStartTime, duration};
+      historyCount++;
+    } else {
+      for (int i = 0; i < 4; i++) {
+        sessionHistory[i] = sessionHistory[i + 1];
+      }
+      sessionHistory[4] = {fanStartTime, duration};
+    }
+    fanStartTime = 0;
+  }
+}
+
+void broadcastState() {
+  DynamicJsonDocument doc(512);
+  doc["fanOn"] = fanOn;
+  doc["fanSpeed"] = fanSpeed;
+  doc["fanDirection"] = fanDirection;
+  doc["totalOnTime"] = totalOnTime;
+  doc["sessionTime"] = fanOn && fanStartTime != 0 ? (millis() / 1000 - fanStartTime) : 0;
+  doc["scheduleActive"] = scheduleActive;
+  JsonArray history = doc.createNestedArray("history");
+  for (int i = 0; i < historyCount; i++) {
+    JsonObject session = history.createNestedObject();
+    session["startTime"] = sessionHistory[i].startTime;
+    session["duration"] = sessionHistory[i].duration;
+  }
+  String json;
+  serializeJson(doc, json);
+  webSocket.broadcastTXT(json);
+}
